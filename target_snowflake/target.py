@@ -86,6 +86,8 @@ class TargetSnowflake(SQLTarget):
             description="Whether to use SSO authentication using an external browser.",
         ),
     ).to_dict()
+    
+    _MAX_RECORD_AGE_IN_MINUTES: float = 30.0
 
     default_sink_class = SnowflakeSink
 
