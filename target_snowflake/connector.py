@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import urllib.parse
+from enum import Enum
+from functools import cached_property
 from operator import contains, eq
-from typing import TYPE_CHECKING, Any, Iterable, Sequence, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 
 import snowflake.sqlalchemy.custom_types as sct
 import sqlalchemy
@@ -10,6 +14,7 @@ from cryptography.hazmat.primitives import serialization
 from singer_sdk import typing as th
 from singer_sdk.connectors import SQLConnector
 from singer_sdk.connectors.sql import FullyQualifiedName
+from singer_sdk.exceptions import ConfigValidationError
 from snowflake.sqlalchemy import URL
 from snowflake.sqlalchemy.base import SnowflakeIdentifierPreparer
 from snowflake.sqlalchemy.snowdialect import SnowflakeDialect
@@ -18,6 +23,8 @@ from sqlalchemy.sql import text
 from target_snowflake.snowflake_types import NUMBER, TIMESTAMP_NTZ, VARIANT
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Sequence
+
     from sqlalchemy.engine import Engine
 
 SNOWFLAKE_MAX_STRING_LENGTH = 16777216
@@ -60,6 +67,14 @@ class SnowflakeFullyQualifiedName(FullyQualifiedName):
 
     def prepare_part(self, part: str) -> str:
         return self.dialect.identifier_preparer.quote(part)
+
+
+class SnowflakeAuthMethod(Enum):
+    """Supported methods to authenticate to snowflake"""
+
+    BROWSER = 1
+    PASSWORD = 2
+    KEY_PAIR = 3
 
 
 class SnowflakeConnector(SQLConnector):
@@ -124,6 +139,47 @@ class SnowflakeConnector(SQLConnector):
 
         return sql_type
 
+    def get_private_key(self):
+        """Get private key from the right location."""
+        phrase = self.config.get("private_key_passphrase")
+        encoded_passphrase = phrase.encode() if phrase else None
+        if "private_key_path" in self.config:
+            with Path(self.config["private_key_path"]).open("rb") as key:
+                key_content = key.read()
+        else:
+            key_content = self.config["private_key"].encode()
+
+        p_key = serialization.load_pem_private_key(
+            key_content,
+            password=encoded_passphrase,
+            backend=default_backend(),
+        )
+
+        return p_key.private_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+
+    @cached_property
+    def auth_method(self) -> SnowflakeAuthMethod:
+        """Validate & return the authentication method based on config."""
+        if self.config.get("use_browser_authentication"):
+            return SnowflakeAuthMethod.BROWSER
+
+        valid_auth_methods = {"private_key", "private_key_path", "password"}
+        config_auth_methods = [x for x in self.config if x in valid_auth_methods]
+        if len(config_auth_methods) != 1:
+            msg = (
+                "Neither password nor private key was provided for "
+                "authentication. For password-less browser authentication via SSO, "
+                "set use_browser_authentication config option to True."
+            )
+            raise ConfigValidationError(msg)
+        if config_auth_methods[0] in ["private_key", "private_key_path"]:
+            return SnowflakeAuthMethod.KEY_PAIR
+        return SnowflakeAuthMethod.PASSWORD
+
     def get_sqlalchemy_url(self, config: dict) -> str:
         """Generates a SQLAlchemy URL for Snowflake.
 
@@ -136,17 +192,10 @@ class SnowflakeConnector(SQLConnector):
             "database": config["database"],
         }
 
-        if config.get("use_browser_authentication"):
+        if self.auth_method == SnowflakeAuthMethod.BROWSER:
             params["authenticator"] = "externalbrowser"
-        elif "password" in config:
-            params["password"] = config["password"]
-        elif "private_key_path" not in config:
-            msg = (
-                "Neither password nor private_key_path was provided for "
-                "authentication. For password-less browser authentication via SSO, "
-                "set use_browser_authentication config option to True."
-            )
-            raise Exception(msg)  # noqa: TRY002
+        elif self.auth_method == SnowflakeAuthMethod.PASSWORD:
+            params["password"] = urllib.parse.quote(config["password"])
 
         for option in ["warehouse", "role"]:
             if config.get(option):
@@ -172,31 +221,20 @@ class SnowflakeConnector(SQLConnector):
             "session_parameters": {
                 "QUOTED_IDENTIFIERS_IGNORE_CASE": "TRUE",
             },
+            "client_session_keep_alive": True,  # See https://github.com/snowflakedb/snowflake-connector-python/issues/218
         }
-        if "private_key_path" in self.config:
-            with open(self.config["private_key_path"], "rb") as private_key_file:  # noqa: PTH123
-                private_key = serialization.load_pem_private_key(
-                    private_key_file.read(),
-                    password=self.config["private_key_passphrase"].encode()
-                    if "private_key_passphrase" in self.config
-                    else None,
-                    backend=default_backend(),
-                )
-                connect_args["private_key"] = private_key.private_bytes(
-                    encoding=serialization.Encoding.DER,
-                    format=serialization.PrivateFormat.PKCS8,
-                    encryption_algorithm=serialization.NoEncryption(),
-                )
+        if self.auth_method == SnowflakeAuthMethod.KEY_PAIR:
+            connect_args["private_key"] = self.get_private_key()
         engine = sqlalchemy.create_engine(
             self.sqlalchemy_url,
             connect_args=connect_args,
             echo=False,
         )
-        connection = engine.connect()
-        db_names = [db[1] for db in connection.execute(text("SHOW DATABASES;")).fetchall()]
-        if self.config["database"] not in db_names:
-            msg = f"Database '{self.config['database']}' does not exist or the user/role doesn't have access to it."
-            raise Exception(msg)  # noqa: TRY002
+        with engine.connect() as conn:
+            db_names = [db[1] for db in conn.execute(text("SHOW DATABASES;")).fetchall()]
+            if self.config["database"] not in db_names:
+                msg = f"Database '{self.config['database']}' does not exist or the user/role doesn't have access to it."
+                raise Exception(msg)  # noqa: TRY002
         return engine
 
     def prepare_column(
@@ -469,7 +507,7 @@ class SnowflakeConnector(SQLConnector):
             sync_id: The sync ID for the batch.
             files: The files containing records to upload.
         """
-        with self._connect() as conn:
+        with self._connect() as conn, conn.begin():
             for file_uri in files:
                 put_statement, kwargs = self._get_put_statement(
                     sync_id=sync_id,
@@ -477,7 +515,7 @@ class SnowflakeConnector(SQLConnector):
                 )
                 # sqlalchemy.text stripped a slash, which caused windows to fail so we used bound parameters instead
                 # See https://github.com/MeltanoLabs/target-snowflake/issues/87 for more information about this error
-                conn.execute(put_statement, file_uri=file_uri, **kwargs)
+                conn.execute(put_statement, {"file_uri": file_uri, **kwargs})
 
     def create_file_format(self, file_format: str) -> None:
         """Create a file format in the schema.
@@ -485,7 +523,7 @@ class SnowflakeConnector(SQLConnector):
         Args:
             file_format: The name of the file format.
         """
-        with self._connect() as conn:
+        with self._connect() as conn, conn.begin():
             file_format_statement, kwargs = self._get_file_format_statement(
                 file_format=file_format,
             )
@@ -510,7 +548,7 @@ class SnowflakeConnector(SQLConnector):
             schema: The schema of the data.
             key_properties: The primary key properties of the data.
         """
-        with self._connect() as conn:
+        with self._connect() as conn, conn.begin():
             merge_statement, kwargs = self._get_merge_from_stage_statement(
                 full_table_name=full_table_name,
                 schema=schema,
@@ -519,7 +557,8 @@ class SnowflakeConnector(SQLConnector):
                 key_properties=key_properties,
             )
             self.logger.debug("Merging with SQL: %s", merge_statement)
-            conn.execute(merge_statement, **kwargs)
+            result = conn.execute(merge_statement, **kwargs)
+            return result.rowcount
 
     def copy_from_stage(
         self,
@@ -536,7 +575,7 @@ class SnowflakeConnector(SQLConnector):
             sync_id: The sync ID for the batch.
             file_format: The name of the file format.
         """
-        with self._connect() as conn:
+        with self._connect() as conn, conn.begin():
             copy_statement, kwargs = self._get_copy_statement(
                 full_table_name=full_table_name,
                 schema=schema,
@@ -544,7 +583,8 @@ class SnowflakeConnector(SQLConnector):
                 file_format=file_format,
             )
             self.logger.debug("Copying with SQL: %s", copy_statement)
-            conn.execute(copy_statement, **kwargs)
+            result = conn.execute(copy_statement, **kwargs)
+            return result.rowcount
 
     def drop_file_format(self, file_format: str) -> None:
         """Drop a file format in the schema.
@@ -552,7 +592,7 @@ class SnowflakeConnector(SQLConnector):
         Args:
             file_format: The name of the file format.
         """
-        with self._connect() as conn:
+        with self._connect() as conn, conn.begin():
             drop_statement, kwargs = self._get_drop_file_format_statement(
                 file_format=file_format,
             )
@@ -565,7 +605,7 @@ class SnowflakeConnector(SQLConnector):
         Args:
             sync_id: The sync ID for the batch.
         """
-        with self._connect() as conn:
+        with self._connect() as conn, conn.begin():
             remove_statement, kwargs = self._get_stage_files_remove_statement(
                 sync_id=sync_id,
             )
